@@ -7,14 +7,17 @@ i relè del riscaldamento.
 
 - **Termostato da stanza** — legge la temperatura (DS18B20), mostra tutto su
   un piccolo OLED, si regola con un encoder rotativo, pubblica/riceve stato e
-  comandi via MQTT. Un termostato per stanza (si duplica lo sketch cambiando
-  il nome della zona).
+  comandi via MQTT. **Un solo firmware per tutte le stanze**: la zona si
+  sceglie dal portale web.
 - **Centralina 4 relè** — un unico ESP8266 che pilota fisicamente il
   riscaldamento di 4 zone (relè), leggendo via MQTT cosa chiede ciascun
   termostato. Gestisce anche 4 pulsanti locali per comando manuale.
 
 Nessun server proprio da mantenere: basta un broker MQTT qualunque (es.
 **Mosquitto** dentro Home Assistant) e la rete WiFi di casa.
+
+Entrambi i firmware si aggiornano **via OTA** (da Arduino IDE o caricando il
+`.bin` dal portale web).
 
 ---
 
@@ -24,6 +27,7 @@ Nessun server proprio da mantenere: basta un broker MQTT qualunque (es.
 |---|---|
 | `sketch_termiostati_mqtt_per_homeassistant_V1/` | Firmware del termostato da stanza (ESP8266 + DS18B20 + OLED + encoder) |
 | `centralina_termostati_4rele/` | Firmware della centralina (ESP8266 + 4 relè + 4 pulsanti) |
+| `homeassistant/` | Esempi di configurazione Home Assistant |
 | `images/` | Foto della realizzazione |
 | `termostato v1 v13.3mf` | Case del termostato pronto per la stampa 3D (progetto slicer) |
 
@@ -56,6 +60,11 @@ Home Assistant si collega allo stesso broker MQTT e vede/comanda tutto:
 è il punto in cui imposti orari, automazioni, presenza, ecc. — i due firmware
 si limitano a eseguire.
 
+Qualunque cosa pubblichi `termostato/<Zona>/heating` e `.../season` nel
+formato giusto può sostituire un termostato ESP: per esempio uno **Shelly
+Wall Display** tramite un'automazione di Home Assistant
+(vedi `homeassistant/sala_x2i_bridge.yaml`).
+
 ---
 
 ## Hardware
@@ -64,16 +73,20 @@ si limitano a eseguire.
 - **NodeMCU ESP8266**
 - Sensore di temperatura **DS18B20** (OneWire) + resistenza pull-up 4.7 kΩ tra DQ e VCC
 - Display **OLED 128×32 SSD1306** (I²C)
-- **Encoder rotativo** con pulsante (setpoint + cambio stagione)
+- **Encoder rotativo** con pulsante (setpoint, stagione, portale)
 
 ```
 Wire.begin(12,14):  SDA = D6 (GPIO12)   SCL = D5 (GPIO14)   [OLED]
 PIN_ONEWIRE = D0 (GPIO16)                                   [DS18B20, DQ]
-PIN_ENC_CLK = D1 (GPIO5)
-PIN_ENC_DT  = D2 (GPIO4)
+PIN_ENC_CLK = D1 (GPIO5)     (interrupt)
+PIN_ENC_DT  = D2 (GPIO4)     (interrupt)
 PIN_ENC_SW  = D7 (GPIO13)
-PIN_RESET   = GPIO0 (FLASH)   tenuto premuto all'avvio = reset di fabbrica
+PIN_FLASH   = GPIO0 (FLASH)  tenuto premuto 5 s = reset di fabbrica
 ```
+
+> Il DS18B20 vicino all'ESP8266 legge qualche grado in più per il calore
+> della scheda: per questo esiste la **correzione sensore** nel portale
+> (default −2.5 °C). Meglio ancora: sensore su un cavetto, lontano dall'ESP.
 
 ### Centralina 4 relè
 - **NodeMCU ESP8266**
@@ -81,102 +94,155 @@ PIN_RESET   = GPIO0 (FLASH)   tenuto premuto all'avvio = reset di fabbrica
 - 4 pulsanti (uno per zona), verso GND, pull-up interno
 
 ```
-Zona            Relè (uscita)     Pulsante (ingresso)
+Zona (default)  Relè (uscita)     Pulsante (ingresso)
 Bagno           D0 (GPIO16)       D6 (GPIO12)
 CameraPiccola   D1 (GPIO5)        D7 (GPIO13)
 Sala            D2 (GPIO4)        D3 (GPIO0)   ⚠️ vedi nota sotto
 CameraGrande    D5 (GPIO14)       D4 (GPIO2)   ⚠️ vedi nota sotto
 ```
 
-> **Nota GPIO0 (pulsante Sala):** è lo stesso pin usato per il reset di
-> fabbrica tenuto premuto all'avvio. Non è un errore di cablaggio, è
-> condiviso di proposito — basta non tenerlo premuto mentre il dispositivo
-> si accende.
+> **Nota GPIO0 (pulsante Sala):** se è premuto mentre la centralina si
+> accende, l'ESP8266 entra in modalità programmazione e non parte.
 > **Nota GPIO2 (pulsante CameraGrande):** deve restare alto al boot; un
 > pulsante con pull-up interno (come qui) va benissimo.
 
+### Consigli di alimentazione (stabilità)
+Riavvii casuali "ogni tot giorni" spesso sono elettrici, non software:
+- alimentatore 5 V decente (≥1 A), non una porta USB qualsiasi;
+- modulo relè con **JD-VCC separato** (togli il jumper, 5 V alle bobine,
+  3.3 V alla logica degli optoisolatori) così l'uscita a 3.3 V dell'ESP
+  spegne davvero il relè;
+- **snubber RC / varistore** sui carichi induttivi a 230 V (valvole di zona,
+  contattori): i disturbi allo stacco resettano l'ESP.
+
+Il campo `reset` nel topic `.../info` dice il motivo dell'ultimo riavvio
+(`Power On`, `Software/System restart`, `Hardware Watchdog`, `Exception`…).
+
 ---
 
-## Compilazione e flash
+## Compilazione e primo flash (via USB, una sola volta)
 
-Sono progetti **Arduino IDE** (o arduino-cli) per **ESP8266** (board:
-*NodeMCU 1.0 (ESP-12E Module)*).
+Progetti **Arduino IDE** (o arduino-cli) per **ESP8266**, core **3.1.x**.
 
-Librerie richieste (installabili dal Library Manager):
-- `WiFiManager` (tzapu)
+Impostazioni scheda (Strumenti):
+- **Scheda:** *NodeMCU 1.0 (ESP-12E Module)*
+- **Flash Size:** **4MB (FS:2MB OTA:~1019KB)** — usa sempre questa: se cambi
+  la dimensione del filesystem la configurazione salvata viene persa.
+
+Librerie (Library Manager):
+- `WiFiManager` (tzapu) **2.0.x**
 - `PubSubClient` (Nick O'Leary)
 - `ArduinoJson` (Benoit Blanchon, v6 o v7)
 - Solo per il termostato: `Adafruit SSD1306`, `Adafruit GFX Library`, `OneWire`, `DallasTemperature`
 
-Poi: apri lo sketch giusto, seleziona la porta, **Upload**. Monitor seriale a
-115200 baud per il log di avvio.
+`LittleFS` e `ArduinoOTA` sono già inclusi nel core ESP8266.
 
-Per 4 termostati: duplica la cartella `sketch_termiostati_mqtt_per_homeassistant_V1/`
-e cambia la costante di zona in testa al file (di default `"CameraPiccola"`,
-usata in tutti i topic `termostato/<Zona>/...`) con il nome della stanza.
+Il **primo** caricamento del firmware v2 va fatto via USB. Da lì in poi si
+aggiorna via rete (vedi *Aggiornamento OTA*).
+
+> **Aggiornando da v1:** al primo avvio il firmware converte la memoria da
+> SPIFFS a LittleFS e **recupera da solo** WiFi e credenziali MQTT. Sul
+> termostato si apre il portale per chiedere la **zona** (in v1 era scritta
+> nel codice): è l'unica cosa da reinserire.
 
 ---
 
-## Primo avvio
+## Portale di configurazione
 
-Al primo avvio (o dopo un reset di fabbrica) entrambi i dispositivi aprono un
-**portale di configurazione** WiFi:
+Si apre da solo al primo avvio (o dopo un reset di fabbrica). Si può
+riaprire in qualsiasi momento **senza fermare il dispositivo**:
+- **Termostato:** tieni premuto il pulsante dell'encoder **8 secondi**;
+- **Centralina:** tieni premuti insieme **Bagno + CameraGrande** per **3 secondi**.
 
-1. Connettiti alla rete **`ESP_Config`**, password **`pizaff123`**.
-2. Si apre (o vai su) **http://192.168.4.1**.
-3. Scegli la tua rete WiFi di casa e inserisci **server, porta, utente e
-   password del broker MQTT**.
-4. Salva: il dispositivo si riavvia e si connette alla tua rete + al broker.
+Aperto a mano, si chiude da solo dopo 5 minuti.
 
-Le credenziali vengono salvate **solo** in `/config.json` sulla flash del
-dispositivo — non sono mai scritte nel codice sorgente.
+1. Connettiti alla rete **`ESP_Config-XXXX`** (XXXX = ultime cifre del chip,
+   le vedi sul display del termostato), password **`pizaff123`**.
+2. Vai su **http://192.168.4.1**. Il menu ha solo le voci essenziali:
+   - **Configure WiFi** — scegli la rete di casa e la password;
+   - **Setup** — impostazioni del dispositivo:
+     - *MQTT:* server, porta, utente, password;
+     - *Termostato:* zona e correzione sensore (°C);
+       *Centralina:* nomi delle 4 zone (uguali a quelli dei termostati);
+     - *Aggiornamento OTA:* password OTA;
+   - **Update** — carica un nuovo firmware `.bin` dal browser;
+   - **Restart** / **Exit**.
+3. Salva: il dispositivo si riavvia con la nuova configurazione.
 
-**Reset di fabbrica:** tieni premuto il pulsante FLASH (GPIO0) all'accensione
-finché non riparte. Sulla centralina è lo stesso pulsante della zona Sala
-(vedi nota pinout sopra).
+Se la password WiFi è sbagliata il portale **resta aperto** e puoi
+correggerla. Le credenziali stanno solo nella flash del dispositivo
+(`/net.json`), mai nel codice sorgente.
 
-**Riaprire il portale senza perdere la configurazione (solo centralina):**
-tieni premuti insieme i pulsanti **Bagno** e **CameraGrande** per 3 secondi.
+**Zona:** lettere, numeri, `_` e `-` (es. `Sala`, `CameraGrande`). Diventa
+parte dei topic MQTT (`termostato/Sala/...`) e del nome di rete
+(`termostato-sala`).
+
+**Reset di fabbrica** (cancella WiFi, MQTT e impostazioni):
+- **Termostato:** tieni premuto il tasto **FLASH** per 5 secondi;
+- **Centralina:** tieni premuti **Bagno + CameraGrande** per 15 secondi.
+
+---
+
+## Aggiornamento OTA
+
+Due modi, entrambi senza cavo:
+
+1. **Da Arduino IDE** — imposta una *Password OTA* nel portale. Il
+   dispositivo compare tra le porte come `termostato-<zona>` o
+   `centralina-risc`: selezionalo e premi *Carica* (chiede la password OTA).
+   Se il PC è in un'altra VLAN, l'mDNS non passa: carica indicando l'IP con
+   `espota.py -i <IP> -a <password> -f firmware.bin` (lo trovi nel core
+   ESP8266, cartella `tools/`). Serve la porta UDP/TCP 8266 aperta verso il
+   dispositivo.
+2. **Dal portale web** — *Sketch → Esporta binario compilato* in Arduino
+   IDE, poi apri il portale e usa **Update**.
+
+Durante l'aggiornamento il termostato mostra la barra di avanzamento; la
+centralina **spegne tutti i relè** prima di iniziare. Al riavvio tutto
+riparte dallo stato salvato.
 
 ---
 
 ## Uso quotidiano
 
 ### Termostato da stanza
-- **Ruota l'encoder** → cambia il setpoint (0.5°C a scatto), mostrato a
-  schermo per qualche secondo.
-- **Pressione lunga (≥2s)** sul pulsante encoder → alterna stagione
-  inverno/estate.
-- Il display mostra la temperatura ambiente, con icona 🔥/❄️ quando c'è
-  richiesta attiva, e due indicatori in basso a destra (WiFi / MQTT connessi).
+- **Ruota l'encoder** → il primo scatto mostra il setpoint, i successivi lo
+  cambiano (0.5 °C a scatto).
+- **Pressione lunga (2–8 s)** sul pulsante encoder → alterna inverno/estate.
+- **Pressione 8 s** → apre il portale di configurazione.
+- Il display mostra la temperatura ambiente, con 🔥/❄️ quando c'è richiesta
+  attiva, `OFF` se il termostato è spento, e due indicatori in basso a destra
+  (WiFi ● / MQTT ■, pieni = connessi).
+- Dopo 1 minuto senza interazioni il display si **attenua**; il numero si
+  sposta di qualche pixel ogni 2 minuti (anti burn-in dell'OLED).
 
 ### Centralina
 - **Pressione breve** su un pulsante zona → accende/spegne manualmente quella
   zona (bypassa i tempi minimi, utile in manutenzione).
 - **Pressione lunga (≥2s)** su un pulsante qualsiasi → **spegnimento
   immediato di tutte le zone** (sicurezza).
-- Le zone seguono automaticamente i comandi dei termostati via MQTT: non
-  serve fare nulla in condizioni normali.
+- Le zone seguono automaticamente i comandi dei termostati via MQTT.
 
 ---
 
 ## Protocollo MQTT
 
-Ogni termostato pubblica/riceve sotto `termostato/<Zona>/...`
-(`<Zona>` = `Bagno`, `CameraPiccola`, `Sala`, `CameraGrande`, o come li hai
-chiamati):
+Ogni termostato pubblica/riceve sotto `termostato/<Zona>/...`:
 
 | Topic | Direzione | Valori | Note |
 |---|---|---|---|
 | `.../temperature` | termostato → HA | numero (°C) | retained |
 | `.../setpoint` | termostato → HA | numero (°C) | retained |
 | `.../setpoint_cmd` | HA → termostato | numero (°C), 5–30 | |
-| `.../heating` | termostato → **centralina** | `ON` / `OFF` | richiesta di riscaldamento |
+| `.../heating` | termostato → **centralina** | `ON` / `OFF` | richiesta, retained |
+| `.../action` | termostato → HA | `heating` / `cooling` / `idle` / `off` | retained |
 | `.../mode` | termostato → HA | `off` / `heat` / `cool` | retained |
 | `.../mode_cmd` | HA → termostato | `off` / `heat` / `cool` | |
 | `.../season` | termostato → **centralina** | `winter` / `summer` | retained |
 | `.../season_cmd` | HA → termostato | `winter` / `summer` | |
-| `.../availability` | termostato → HA | `online` / `offline` | LWT |
+| `.../sensor` | termostato → HA | `ok` / `error` | retained |
+| `.../availability` | termostato → HA + centralina | `online` / `offline` | LWT |
+| `.../info` | termostato → HA | JSON (fw, ip, rssi, reset, heap, uptime) | retained, ogni 5 min |
 
 La centralina, per ogni zona, pubblica sotto `riscaldamento/<Zona>/...`:
 
@@ -185,8 +251,8 @@ La centralina, per ogni zona, pubblica sotto `riscaldamento/<Zona>/...`:
 | `.../state` | centralina → HA | `ON` / `OFF` | stato reale del relè, retained |
 | `.../set` | HA → centralina | `ON` / `OFF` | override manuale, valido solo in `winter` |
 
-Più `riscaldamento/centralina/availability` (`online`/`offline`, LWT) per
-sapere se la centralina stessa è raggiungibile.
+Più `riscaldamento/centralina/availability` (`online`/`offline`, LWT) e
+`riscaldamento/centralina/info` (JSON diagnostico).
 
 ### Esempio configurazione Home Assistant (per zona)
 
@@ -194,20 +260,29 @@ sapere se la centralina stessa è raggiungibile.
 mqtt:
   climate:
     - name: "Termostato Camera Piccola"
+      unique_id: termostato_camerapiccola
       modes: ["off", "heat", "cool"]
       current_temperature_topic: "termostato/CameraPiccola/temperature"
       temperature_command_topic: "termostato/CameraPiccola/setpoint_cmd"
       temperature_state_topic: "termostato/CameraPiccola/setpoint"
       mode_command_topic: "termostato/CameraPiccola/mode_cmd"
       mode_state_topic: "termostato/CameraPiccola/mode"
+      action_topic: "termostato/CameraPiccola/action"
       availability_topic: "termostato/CameraPiccola/availability"
       min_temp: 5
       max_temp: 30
       temp_step: 0.5
+  binary_sensor:
+    - name: "Sensore Camera Piccola guasto"
+      unique_id: termostato_camerapiccola_sensor
+      state_topic: "termostato/CameraPiccola/sensor"
+      payload_on: "error"
+      payload_off: "ok"
+      device_class: problem
 ```
 
-Ripeti per ciascuna zona cambiando `CameraPiccola` con il nome usato nello
-sketch di quel termostato.
+Ripeti per ciascuna zona cambiando `CameraPiccola` con il nome impostato nel
+portale di quel termostato.
 
 ---
 
@@ -215,51 +290,57 @@ sketch di quel termostato.
 
 ### Isteresi e stagione (termostato)
 
-`callForHeat` diventa vero/falso con **0.3°C di isteresi** attorno al
+La richiesta diventa vera/falsa con **0.3 °C di isteresi** attorno al
 setpoint, invertita tra le due stagioni: in `winter` scalda sotto il
 setpoint, in `summer` raffresca sopra. Il calcolo è sempre locale sul
 termostato: funziona anche se la centralina o il broker sono momentaneamente
 irraggiungibili.
 
+Il sensore è considerato guasto dopo **3 letture errate consecutive**
+(assente = −127, valore di accensione 85 °C, fuori range): la richiesta va a
+`OFF`, il display mostra "Sensore non rilevato" e su MQTT esce
+`sensor = error`. Una singola lettura sbagliata viene ignorata.
+
 ### Tempi minimi e sfasamento (centralina)
 
-Per non stressare caldaia/pompa e non far scattare tutti i relè insieme:
-
 - **ON minimo 3 minuti**, **OFF minimo 2 minuti** per zona (anti-ciclo).
-- Accensioni **sfasate di 800ms** l'una dall'altra quando più zone
-  diventano eleggibili insieme (es. dopo una riconnessione MQTT).
+- Accensioni **sfasate di 800 ms** l'una dall'altra.
 - **Timeout di sicurezza 15 minuti**: se una zona non riceve un comando
-  `heating` aggiornato entro questa finestra, si considera scaduto e si
-  spegne da sola. In funzionamento normale non scatta mai: ogni termostato
-  ripubblica il proprio stato ogni 10s (più subito ad ogni cambiamento), con
-  un margine enorme rispetto ai 15 minuti.
-- **In estate (`summer`) il relè della zona è sempre spento**, subito,
-  bypassando i tempi minimi (non c'è motivo di aspettare per spegnere).
-- Pulsanti fisici e MQTT non sono mai bloccanti tra loro: il ciclo principale
-  gira sempre, anche a broker MQTT irraggiungibile.
+  `heating` aggiornato entro questa finestra, si spegne da sola. Ogni
+  termostato ripubblica il proprio stato ogni 10 s.
+- **Termostato offline** (LWT `availability = offline`): la zona si spegne
+  subito (rispettando il tempo minimo ON), senza aspettare i 15 minuti.
+- **In estate (`summer`) il relè della zona è sempre spento**, subito.
+- Pulsanti fisici, MQTT e portale non sono mai bloccanti tra loro.
+
+### Rete e memoria (affidabilità)
+
+- Il WiFi si riconnette da solo; se resta giù a lungo il dispositivo
+  ritenta ogni minuto e si riavvia dopo 10 min (termostato) / 15 min
+  (centralina). **Le credenziali non vengono mai cancellate** da questi
+  tentativi.
+- Se all'accensione il WiFi non c'è (es. router ancora spento dopo un
+  blackout) il dispositivo **non** apre il portale: aspetta la rete.
+- Configurazione e stato (setpoint, modo) sono in due file separati su
+  LittleFS, scritti in modo atomico (file temporaneo + rinomina): un blackout
+  durante il salvataggio lascia il file precedente intatto. Lo stato si salva
+  solo se cambia davvero, 10 s dopo l'ultima modifica.
 
 ---
 
 ## Limiti noti
 
-Alcuni compromessi consapevoli, utile saperli prima di affidarci un impianto:
-
-- **Il portale di configurazione blocca il dispositivo.** Mentre è aperto
-  (fino a 3 minuti, sia all'avvio sia riaperto con la combo pulsanti) il
-  ciclo principale è fermo: sulla centralina questo significa che una zona
-  già accesa non può essere spenta né dai pulsanti né da MQTT finché il
-  portale non si chiude. È un limite della libreria WiFiManager usata in
-  modalità bloccante.
-- **Nessuna cifratura verso il broker MQTT** (niente TLS): password e dati
-  viaggiano in chiaro sulla rete locale. Adeguato per una LAN domestica
-  fidata, da rivedere se il broker è esposto oltre la rete di casa.
-- **Guasto del sensore di temperatura visibile solo sull'OLED**, non
-  ripubblicato come stato d'errore via MQTT (Home Assistant continua a
-  mostrare l'ultima temperatura valida finché il sensore non torna a
-  funzionare).
-- **Se un termostato smette di essere raggiungibile** (crash, WiFi giù),
-  la centralina continua a fidarsi dell'ultimo comando `heating` ricevuto
-  fino al timeout di sicurezza di 15 minuti.
+- **Nessuna cifratura verso il broker MQTT** (niente TLS): adeguato per una
+  LAN domestica fidata (meglio se in una VLAN dedicata alla domotica).
+- **Portale protetto da una password fissa** (`pizaff123`, costante
+  `AP_PASS` nel codice): il portale però è attivo solo quando lo apri tu o al
+  primo avvio, e la pagina *Update* è raggiungibile solo mentre è aperto.
+- **Durante il salvataggio di una nuova rete WiFi** dal portale la
+  centralina resta occupata fino a 20 s (tentativo di connessione): i relè
+  restano nello stato in cui sono.
+- Se nel portale inserisci una password WiFi sbagliata e poi chiudi il
+  portale, il dispositivo continuerà a provare quella: riapri il portale col
+  pulsante e correggila.
 
 ---
 

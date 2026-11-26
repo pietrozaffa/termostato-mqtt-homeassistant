@@ -1,0 +1,53 @@
+# =====================================================================
+#  Package Home Assistant: Shelly Wall Display X2i (Sala) -> centralina 4 relè
+#  Va in /config/packages/sala_x2i_bridge.yaml
+#  (in configuration.yaml:  homeassistant: packages: !include_dir_named packages)
+#
+#  L'X2i fa da termostato della Sala (sensore, setpoint, isteresi, UI).
+#  Questa automazione traduce il suo stato nel protocollo dei termostati ESP:
+#     termostato/Sala/heating  ON/OFF   (richiesta calore -> centralina)
+#     termostato/Sala/season   winter/summer
+#  La centralina non va toccata: per lei l'X2i è un termostato come gli altri.
+#
+#  Sostituisci climate.wall_display_sala con il nome reale dell'entità.
+#  Se l'X2i è offline/unavailable pubblica OFF (fail-safe).
+#  Ripubblica ogni 30 s: la centralina spegne la zona dopo 15 min senza
+#  comandi, quindi se HA si ferma la Sala si spegne da sola.
+# =====================================================================
+
+automation:
+  - id: sala_x2i_bridge_centralina
+    alias: "Sala: X2i -> centralina riscaldamento"
+    mode: queued
+    max: 5
+    triggers:
+      - trigger: state
+        entity_id: climate.wall_display_sala
+        attribute: hvac_action
+      - trigger: state
+        entity_id: climate.wall_display_sala
+      - trigger: time_pattern
+        seconds: "/30"
+      - trigger: homeassistant
+        event: start
+      - trigger: mqtt
+        topic: riscaldamento/centralina/availability
+        payload: "online"
+    actions:
+      - variables:
+          ent: climate.wall_display_sala
+          season: "{{ 'summer' if is_state(ent, 'cool') else 'winter' }}"
+          heating: >-
+            {{ 'ON' if (states(ent) == 'heat'
+                        and state_attr(ent, 'hvac_action') == 'heating')
+               else 'OFF' }}
+      - action: mqtt.publish
+        data:
+          topic: termostato/Sala/season
+          payload: "{{ season }}"
+          retain: true
+      - action: mqtt.publish
+        data:
+          topic: termostato/Sala/heating
+          payload: "{{ heating }}"
+          retain: true
